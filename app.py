@@ -4,6 +4,7 @@ import email
 import hashlib
 import hmac
 import imaplib
+import json
 import logging
 import os
 import re
@@ -14,7 +15,6 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-import requests
 from flask import Flask, jsonify, request
 
 app = Flask(__name__)
@@ -45,15 +45,6 @@ ALARM_SUBJECT_FILTER = (
 )
 
 DESK360_API_KEY = os.getenv("DESK360_API_KEY", "").strip()
-
-DESK360_BASE_URL = (
-    os.getenv(
-        "DESK360_BASE_URL",
-        "https://public-api.desk360.com/v1",
-    )
-    .strip()
-    .rstrip("/")
-)
 
 DESK360_WEBHOOK_TOKEN = os.getenv(
     "DESK360_WEBHOOK_TOKEN",
@@ -93,10 +84,8 @@ MAX_UNREAD_MESSAGES = max(
     int(os.getenv("MAX_UNREAD_MESSAGES", "20")),
 )
 
-REQUEST_TIMEOUT_SECONDS = max(
-    10,
-    int(os.getenv("REQUEST_TIMEOUT_SECONDS", "30")),
-)
+# Render yeniden başlatılırsa /tmp içindeki kayıt silinebilir.
+LAST_WEBHOOK_FILE = "/tmp/desk360_last_webhook.json"
 
 
 # ============================================================
@@ -141,19 +130,21 @@ def secondary_is_active(
 ) -> bool:
     """
     Secondary numara:
-    Pazartesi-Cuma, 09:00 dahil, 18:00 hariç.
+    - Pazartesi-Cuma
+    - 09:00 dahil
+    - 18:00 hariç
     """
     now = at or local_now()
 
     is_weekday = now.weekday() < 5
 
-    is_working_hour = (
+    is_working_hours = (
         SECONDARY_START_HOUR
         <= now.hour
         < SECONDARY_END_HOUR
     )
 
-    return is_weekday and is_working_hour
+    return is_weekday and is_working_hours
 
 
 def get_recipients(
@@ -162,25 +153,20 @@ def get_recipients(
     recipients: list[str] = []
 
     if ADMIN_PHONE:
-        recipients.append(
-            normalize_phone(ADMIN_PHONE)
-        )
+        recipients.append(normalize_phone(ADMIN_PHONE))
 
-    if (
-        SECONDARY_PHONE
-        and secondary_is_active(at)
-    ):
+    if SECONDARY_PHONE and secondary_is_active(at):
         recipients.append(
             normalize_phone(SECONDARY_PHONE)
         )
 
-    # Aynı numara iki kez girildiyse tekilleştirir.
+    # Aynı numara iki kez tanımlanmışsa tekilleştirir.
     return list(dict.fromkeys(recipients))
 
 
 def require_control_token() -> tuple[dict[str, Any], int] | None:
     """
-    Yönetim/test adreslerini dış erişime karşı korur.
+    /last-webhook ve /check-mail gibi yönetim adreslerini korur.
     """
     if not CONTROL_TOKEN:
         return (
@@ -196,10 +182,7 @@ def require_control_token() -> tuple[dict[str, Any], int] | None:
 
     provided = (
         request.args.get("token", "")
-        or request.headers.get(
-            "X-Control-Token",
-            "",
-        )
+        or request.headers.get("X-Control-Token", "")
     )
 
     if not hmac.compare_digest(
@@ -217,109 +200,135 @@ def require_control_token() -> tuple[dict[str, Any], int] | None:
     return None
 
 
-def safe_response_body(
-    response: requests.Response,
-) -> Any:
-    try:
-        return response.json()
-    except ValueError:
-        return response.text[:4000]
-
-
 # ============================================================
-# DESK360 API
+# DESK360 WEBHOOK ANALİZİ
 # ============================================================
 
-def desk360_headers() -> dict[str, str]:
-    if not DESK360_API_KEY:
-        raise RuntimeError(
-            "DESK360_API_KEY Render'da eksik."
-        )
-
-    return {
-        "Authorization": (
-            f"Bearer {DESK360_API_KEY}"
-        ),
-        "Accept": "application/json",
-        "Content-Type": "application/json",
+def sanitize_headers(headers: dict[str, str]) -> dict[str, str]:
+    """
+    Hassas olabilecek HTTP başlıklarını gizler.
+    """
+    hidden_names = {
+        "authorization",
+        "token",
+        "x-token",
+        "x-webhook-token",
+        "x-api-key",
+        "api-key",
+        "cookie",
     }
 
+    result: dict[str, str] = {}
 
-def desk360_get(path: str) -> Any:
-    """
-    Desk360 Public API'ye GET isteği gönderir.
-    """
-    url = f"{DESK360_BASE_URL}{path}"
+    for name, value in headers.items():
+        if name.lower() in hidden_names:
+            result[name] = "***GİZLENDİ***"
+        else:
+            result[name] = value
 
-    response = requests.get(
-        url,
-        headers=desk360_headers(),
-        timeout=REQUEST_TIMEOUT_SECONDS,
-    )
-
-    body = safe_response_body(response)
-
-    if not response.ok:
-        raise RuntimeError(
-            f"Desk360 GET {path} başarısız: "
-            f"HTTP {response.status_code} - {body}"
-        )
-
-    return body
+    return result
 
 
-def extract_possible_integration_ids(
+def find_possible_ids(
     value: Any,
+    path: str = "root",
 ) -> list[dict[str, Any]]:
     """
-    /integrations cevabındaki olası entegrasyon
-    kimliklerini gösterir. Otomatik seçim yapmaz.
+    Desk360 webhook içindeki olası entegrasyon ve Meta
+    kimliklerini otomatik olarak bulmaya çalışır.
     """
     results: list[dict[str, Any]] = []
 
-    def walk(item: Any) -> None:
-        if isinstance(item, dict):
-            possible_id = (
-                item.get("integration_id")
-                or item.get("integrationId")
-                or item.get("id")
-            )
+    exact_target_names = {
+        "integrationid",
+        "integration_id",
+        "integration",
+        "phone_number_id",
+        "phonenumberid",
+        "waba_id",
+        "wabaid",
+        "business_account_id",
+        "businessaccountid",
+        "whatsapp_business_account_id",
+        "whatsappbusinessaccountid",
+    }
 
-            if possible_id is not None:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            child_path = f"{path}.{key}"
+            normalized_key = key.lower().replace("-", "_")
+
+            if (
+                normalized_key in exact_target_names
+                or "integration" in normalized_key
+                or normalized_key.endswith("_id")
+                or normalized_key.endswith("id")
+            ):
                 results.append(
                     {
-                        "possible_integration_id": (
-                            possible_id
-                        ),
-                        "name": (
-                            item.get("name")
-                            or item.get("title")
-                        ),
-                        "phone": (
-                            item.get("phone")
-                            or item.get("phone_number")
-                            or item.get("phoneNumber")
-                        ),
-                        "status": item.get("status"),
-                        "type": item.get("type"),
-                        "raw": item,
+                        "path": child_path,
+                        "field": key,
+                        "value": child,
                     }
                 )
 
-            for child in item.values():
-                walk(child)
+            results.extend(
+                find_possible_ids(
+                    child,
+                    child_path,
+                )
+            )
 
-        elif isinstance(item, list):
-            for child in item:
-                walk(child)
-
-    walk(value)
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            results.extend(
+                find_possible_ids(
+                    child,
+                    f"{path}[{index}]",
+                )
+            )
 
     return results
 
 
+def verify_optional_webhook_token() -> bool:
+    """
+    Desk360 token'ı hangi başlıkla gönderirse göndersin,
+    yaygın alanlarda kontrol etmeye çalışır.
+
+    Token hiç gönderilmezse webhook'u reddetmez; yalnızca
+    kaydı alır. Böylece ilk test sırasında veri kaybolmaz.
+    """
+    if not DESK360_WEBHOOK_TOKEN:
+        return True
+
+    candidates = [
+        request.headers.get("Authorization", ""),
+        request.headers.get("Token", ""),
+        request.headers.get("X-Token", ""),
+        request.headers.get("X-Webhook-Token", ""),
+        request.args.get("token", ""),
+    ]
+
+    for candidate in candidates:
+        clean_candidate = candidate.strip()
+
+        if clean_candidate.lower().startswith("bearer "):
+            clean_candidate = clean_candidate[7:].strip()
+
+        if clean_candidate and hmac.compare_digest(
+            clean_candidate,
+            DESK360_WEBHOOK_TOKEN,
+        ):
+            return True
+
+    # İlk kurulumda Desk360'ın token'ı farklı yerde gönderme
+    # ihtimaline karşı veri kaybını önlemek için engellemiyoruz.
+    return False
+
+
 # ============================================================
-# GMAIL / JPG TESTİ
+# GMAIL / JPG KONTROLÜ
 # ============================================================
 
 def message_matches(
@@ -341,8 +350,10 @@ def message_matches(
 def find_jpg_attachments() -> dict[str, Any]:
     """
     Okunmamış alarm e-postalarını kontrol eder.
-    Dosyaları WhatsApp'a göndermez ve e-postaları
-    okundu olarak işaretlemez.
+
+    Bu test fonksiyonu:
+    - Fotoğrafı WhatsApp'a göndermez.
+    - E-postayı okundu yapmaz.
     """
     if not GMAIL_USER:
         raise RuntimeError(
@@ -374,14 +385,11 @@ def find_jpg_attachments() -> dict[str, Any]:
             GMAIL_APP_PASSWORD,
         )
 
-        status, _ = mailbox.select(
-            GMAIL_FOLDER
-        )
+        status, _ = mailbox.select(GMAIL_FOLDER)
 
         if status != "OK":
             raise RuntimeError(
-                f"Gmail klasörü açılamadı: "
-                f"{GMAIL_FOLDER}"
+                f"Gmail klasörü açılamadı: {GMAIL_FOLDER}"
             )
 
         status, data = mailbox.uid(
@@ -395,9 +403,7 @@ def find_jpg_attachments() -> dict[str, Any]:
                 "Gmail UNSEEN araması başarısız."
             )
 
-        uids = data[0].split()[
-            -MAX_UNREAD_MESSAGES:
-        ]
+        uids = data[0].split()[-MAX_UNREAD_MESSAGES:]
 
         result["checked_unread"] = len(uids)
 
@@ -413,10 +419,7 @@ def find_jpg_attachments() -> dict[str, Any]:
             if (
                 status != "OK"
                 or not fetched
-                or not isinstance(
-                    fetched[0],
-                    tuple,
-                )
+                or not isinstance(fetched[0], tuple)
             ):
                 continue
 
@@ -454,19 +457,14 @@ def find_jpg_attachments() -> dict[str, Any]:
                 if not is_jpg:
                     continue
 
-                payload = part.get_payload(
-                    decode=True
-                )
+                payload = part.get_payload(decode=True)
 
                 if not payload:
                     continue
 
                 suffix = (
                     extension
-                    if extension in {
-                        ".jpg",
-                        ".jpeg",
-                    }
+                    if extension in {".jpg", ".jpeg"}
                     else ".jpg"
                 )
 
@@ -530,7 +528,7 @@ def find_jpg_attachments() -> dict[str, Any]:
 
 
 # ============================================================
-# FLASK ADRESLERİ
+# FLASK ENDPOINTLERİ
 # ============================================================
 
 @app.get("/")
@@ -541,21 +539,19 @@ def health() -> Any:
             "status": "ok",
             "service": "kamera-whatsapp-bot",
             "local_time": local_now().isoformat(),
-            "secondary_active": (
-                secondary_is_active()
-            ),
+            "secondary_active": secondary_is_active(),
             "recipients_defined": {
                 "admin": bool(ADMIN_PHONE),
-                "secondary": bool(
-                    SECONDARY_PHONE
-                ),
+                "secondary": bool(SECONDARY_PHONE),
             },
             "desk360_api_key_defined": bool(
                 DESK360_API_KEY
             ),
+            "desk360_webhook_token_defined": bool(
+                DESK360_WEBHOOK_TOKEN
+            ),
             "gmail_defined": bool(
-                GMAIL_USER
-                and GMAIL_APP_PASSWORD
+                GMAIL_USER and GMAIL_APP_PASSWORD
             ),
         }
     )
@@ -567,22 +563,115 @@ def health() -> Any:
 )
 def desk360_webhook() -> Any:
     """
-    Desk360 Public API kayıt ekranının zorunlu
-    tuttuğu webhook adresidir.
+    Desk360 Public API kayıt ekranına yazılacak adres:
+
+    https://kamera-whatsapp-bot.onrender.com/desk360-webhook
     """
-    if request.method == "POST":
-        logging.info(
-            "Desk360 webhook isteği alındı."
+    if request.method == "GET":
+        return jsonify(
+            {
+                "success": True,
+                "message": "Desk360 webhook aktif.",
+            }
+        ), 200
+
+    token_verified = verify_optional_webhook_token()
+
+    payload = request.get_json(silent=True)
+
+    if payload is None:
+        form_data = request.form.to_dict(flat=False)
+        raw_body = request.get_data(
+            as_text=True
         )
+
+        payload = {
+            "form_data": form_data,
+            "raw_body": raw_body,
+        }
+
+    record = {
+        "received_at": local_now().isoformat(),
+        "token_verified": token_verified,
+        "method": request.method,
+        "content_type": request.content_type,
+        "headers": sanitize_headers(
+            dict(request.headers)
+        ),
+        "query_parameters": (
+            request.args.to_dict(flat=False)
+        ),
+        "payload": payload,
+        "possible_ids": find_possible_ids(payload),
+    }
+
+    with open(
+        LAST_WEBHOOK_FILE,
+        "w",
+        encoding="utf-8",
+    ) as file:
+        json.dump(
+            record,
+            file,
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+        )
+
+    logging.info(
+        "Desk360 webhook kaydedildi. "
+        "Token doğrulandı: %s, olası ID sayısı: %s",
+        token_verified,
+        len(record["possible_ids"]),
+    )
 
     return jsonify(
         {
             "success": True,
-            "message": (
-                "Desk360 webhook aktif."
+            "message": "Desk360 webhook alındı.",
+            "possible_id_count": len(
+                record["possible_ids"]
             ),
         }
     ), 200
+
+
+@app.get("/last-webhook")
+def last_webhook() -> Any:
+    """
+    Son Desk360 webhook içeriğini gösterir.
+
+    Örnek:
+    /last-webhook?token=GERCEK_CONTROL_TOKEN
+    """
+    denied = require_control_token()
+
+    if denied:
+        return jsonify(denied[0]), denied[1]
+
+    if not os.path.exists(LAST_WEBHOOK_FILE):
+        return jsonify(
+            {
+                "success": False,
+                "error": (
+                    "Henüz Desk360 webhook isteği gelmedi."
+                ),
+            }
+        ), 404
+
+    with open(
+        LAST_WEBHOOK_FILE,
+        "r",
+        encoding="utf-8",
+    ) as file:
+        record = json.load(file)
+
+    return jsonify(
+        {
+            "success": True,
+            **record,
+        }
+    )
 
 
 @app.get("/recipients")
@@ -590,9 +679,7 @@ def recipients_endpoint() -> Any:
     denied = require_control_token()
 
     if denied:
-        return jsonify(
-            denied[0]
-        ), denied[1]
+        return jsonify(denied[0]), denied[1]
 
     now = local_now()
 
@@ -600,73 +687,17 @@ def recipients_endpoint() -> Any:
         {
             "success": True,
             "local_time": now.isoformat(),
-            "secondary_active": (
-                secondary_is_active(now)
+            "secondary_active": secondary_is_active(
+                now
             ),
             "secondary_schedule": {
                 "days": "Monday-Friday",
-                "start_hour": (
-                    SECONDARY_START_HOUR
-                ),
-                "end_hour": (
-                    SECONDARY_END_HOUR
-                ),
+                "start_hour": SECONDARY_START_HOUR,
+                "end_hour": SECONDARY_END_HOUR,
             },
             "recipients": get_recipients(now),
         }
     )
-
-
-@app.get("/desk360-info")
-def desk360_info() -> Any:
-    """
-    Şablon endpoint'ine kesinlikle gitmez.
-
-    Sadece /integrations cevabını alarak gerçek
-    integration ID'nin bulunmasını sağlar.
-    """
-    denied = require_control_token()
-
-    if denied:
-        return jsonify(
-            denied[0]
-        ), denied[1]
-
-    try:
-        integrations_response = desk360_get(
-            "/integrations"
-        )
-
-        possible_integrations = (
-            extract_possible_integration_ids(
-                integrations_response
-            )
-        )
-
-        return jsonify(
-            {
-                "success": True,
-                "possible_integrations": (
-                    possible_integrations
-                ),
-                "raw_integrations_response": (
-                    integrations_response
-                ),
-            }
-        )
-
-    except Exception as exc:
-        logging.exception(
-            "Desk360 entegrasyon bilgisi "
-            "alınamadı."
-        )
-
-        return jsonify(
-            {
-                "success": False,
-                "error": str(exc),
-            }
-        ), 502
 
 
 @app.get("/check-mail")
@@ -674,9 +705,7 @@ def check_mail_endpoint() -> Any:
     denied = require_control_token()
 
     if denied:
-        return jsonify(
-            denied[0]
-        ), denied[1]
+        return jsonify(denied[0]), denied[1]
 
     try:
         result = find_jpg_attachments()
@@ -684,9 +713,7 @@ def check_mail_endpoint() -> Any:
         return jsonify(
             {
                 "success": True,
-                "local_time": (
-                    local_now().isoformat()
-                ),
+                "local_time": local_now().isoformat(),
                 "secondary_active": (
                     secondary_is_active()
                 ),
